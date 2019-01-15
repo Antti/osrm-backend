@@ -3,6 +3,7 @@
 
 #include <boost/assert.hpp>
 #include <boost/range/iterator_range_core.hpp>
+#include <tbb/tbb.h>
 
 #include <limits>
 #include <memory>
@@ -94,7 +95,7 @@ void forwardRoutingStep(const DataFacade<Algorithm> &facade,
                         const std::size_t row_index,
                         const std::size_t number_of_targets,
                         typename SearchEngineData<Algorithm>::ManyToManyQueryHeap &query_heap,
-                        const std::vector<NodeBucket> &search_space_with_buckets,
+                        const tbb::concurrent_vector<NodeBucket> &search_space_with_buckets,
                         std::vector<EdgeWeight> &weights_table,
                         std::vector<EdgeDuration> &durations_table,
                         std::vector<EdgeDistance> &distances_table,
@@ -159,7 +160,7 @@ void forwardRoutingStep(const DataFacade<Algorithm> &facade,
 void backwardRoutingStep(const DataFacade<Algorithm> &facade,
                          const unsigned column_index,
                          typename SearchEngineData<Algorithm>::ManyToManyQueryHeap &query_heap,
-                         std::vector<NodeBucket> &search_space_with_buckets,
+                         tbb::concurrent_vector<NodeBucket> &search_space_with_buckets,
                          const PhantomNode &phantom_node)
 {
     const auto node = query_heap.DeleteMin();
@@ -187,6 +188,11 @@ manyToManySearch(SearchEngineData<ch::Algorithm> &engine_working_data,
                  const std::vector<std::size_t> &target_indices,
                  const bool calculate_distance)
 {
+    // NOTE: this is number of threads _per_ many-to-many search, not per process.
+    auto env = std::getenv("OSRM_NUM_THREADS");
+    auto num_threads = env != nullptr ? std::atoi(env) : tbb::task_scheduler_init::default_num_threads();
+    tbb::task_scheduler_init task_scheduler{num_threads};
+
     const auto number_of_sources = source_indices.size();
     const auto number_of_targets = target_indices.size();
     const auto number_of_entries = number_of_sources * number_of_targets;
@@ -197,10 +203,10 @@ manyToManySearch(SearchEngineData<ch::Algorithm> &engine_working_data,
                                               MAXIMAL_EDGE_DISTANCE);
     std::vector<NodeID> middle_nodes_table(number_of_entries, SPECIAL_NODEID);
 
-    std::vector<NodeBucket> search_space_with_buckets;
+    tbb::concurrent_vector<NodeBucket> search_space_with_buckets;
 
     // Populate buckets with paths from all accessible nodes to destinations via backward searches
-    for (std::uint32_t column_index = 0; column_index < target_indices.size(); ++column_index)
+    const auto backwards_search = [&](std::uint32_t column_index)
     {
         const auto index = target_indices[column_index];
         const auto &phantom = phantom_nodes[index];
@@ -216,13 +222,29 @@ manyToManySearch(SearchEngineData<ch::Algorithm> &engine_working_data,
             backwardRoutingStep(
                 facade, column_index, query_heap, search_space_with_buckets, phantom);
         }
-    }
+    };
+
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>{0, target_indices.size()},
+        [&](const tbb::blocked_range<std::size_t> &chunk) {
+            for (auto column_idx = chunk.begin(), end = chunk.end(); column_idx != end;
+                 ++column_idx)
+            {
+                backwards_search(column_idx);
+            }
+        }
+    );
+
+    // tbb::concurrent_vector doesn't use a contiguous region of memory when
+    // updated concurrently. Combine into one contiguous region of memory, as
+    // we'll be scanning over it subsequently.
+    search_space_with_buckets.shrink_to_fit();
 
     // Order lookup buckets
-    std::sort(search_space_with_buckets.begin(), search_space_with_buckets.end());
+    tbb::parallel_sort(search_space_with_buckets.begin(), search_space_with_buckets.end());
 
     // Find shortest paths from sources to all accessible nodes
-    for (std::uint32_t row_index = 0; row_index < source_indices.size(); ++row_index)
+    const auto forwards_search = [&](std::uint32_t row_index)
     {
         const auto source_index = source_indices[row_index];
         const auto &source_phantom = phantom_nodes[source_index];
@@ -247,7 +269,17 @@ manyToManySearch(SearchEngineData<ch::Algorithm> &engine_working_data,
                                middle_nodes_table,
                                source_phantom);
         }
-    }
+    };
+
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>{0, source_indices.size()},
+        [&](const tbb::blocked_range<std::size_t> &chunk) {
+            for (auto row_idx = chunk.begin(), end = chunk.end(); row_idx != end; ++row_idx)
+            {
+                forwards_search(row_idx);
+            }
+        }
+    );
 
     return std::make_pair(durations_table, distances_table);
 }
